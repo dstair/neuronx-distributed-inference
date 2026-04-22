@@ -55,6 +55,100 @@ from neuronx_distributed_inference.modules.moe_v2 import initialize_moe_module
 from neuronx_distributed.modules.moe.routing import GroupLimitedRouter
 from transformers import AutoModelForCausalLM
 from transformers.activations import ACT2FN
+
+
+# ---------------------------------------------------------------------------
+# FP8 Expert MLP NKI kernel wrapper
+# ---------------------------------------------------------------------------
+# The upstream expert_isa_kernel_wrapper omits the scale parameters that the
+# underlying NKI kernel already supports.  This thin wrapper passes them
+# through, enabling FP8 expert weights for DeepSeek's MoE layers.
+
+def _patch_moe_expert_mlp_for_fp8(moe_module):
+    """Monkey-patch MoEFusedTKG._expert_mlp to pass FP8 scale tensors."""
+    tkg = getattr(moe_module, "tkg_module", None)
+    if tkg is None:
+        return
+
+    from neuronx_distributed.modules.moe.moe_fused_tkg import (
+        nki_components, ExpertAffinityScaleMode, nc,
+    )
+    import neuronxcc.nki as nki
+
+    original_expert_mlp = tkg._expert_mlp.__func__  # unbound method
+
+    def _expert_mlp_fp8(self, hidden_states, expert_affinities, expert_index):
+        hidden_states_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states_shape[-1])
+
+        if self._can_use_nki_kernel("expert_mlp", hidden_states):
+            grid = (nc(self.logical_nc_config),)
+            if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
+                scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
+            else:
+                scaling_mode = ExpertAffinityScaleMode.POST_SCALE
+
+            gate_up_weights = self.expert_mlps.mlp_op.gate_up_proj.weight
+            gate_up_weights = gate_up_weights.view(
+                self.num_local_experts, self.hidden_size, 2, -1
+            )
+            down_weights = self.expert_mlps.mlp_op.down_proj.weight
+
+            # FP8 scales (None when not quantized)
+            gate_up_scale = None
+            down_scale = None
+            if getattr(self.config, "quantized", False):
+                gate_up_scale = self.expert_mlps.mlp_op.gate_up_proj.scale.view(
+                    self.num_local_experts, 2, -1
+                )
+                down_scale = self.expert_mlps.mlp_op.down_proj.scale.view(
+                    self.num_local_experts, -1
+                )
+
+            # Wrapper that passes scales to the underlying NKI kernel
+            def _expert_kernel_with_scales(
+                inp, gate_up_weights, down_weights,
+                expert_affinities, expert_index,
+                gate_up_weights_scale, down_weights_scale,
+                expert_affinities_scaling_mode,
+            ):
+                import neuronxcc.nki.language as nl
+                T, K = expert_index.shape
+                _, _, H = down_weights.shape
+                out = nl.ndarray((T, H), dtype=inp.dtype, buffer=nl.shared_hbm)
+                nki_components["expert_mlps"](
+                    inp, gate_up_weights, down_weights,
+                    expert_affinities, expert_index,
+                    gate_up_weights_scale, down_weights_scale,
+                    out, expert_affinities_scaling_mode,
+                )
+                return out
+
+            _call = nki.jit(platform_target="trn2")(_expert_kernel_with_scales)
+            output = _call[grid](
+                inp=hidden_states,
+                gate_up_weights=gate_up_weights,
+                down_weights=down_weights,
+                expert_affinities=expert_affinities,
+                expert_index=expert_index,
+                gate_up_weights_scale=gate_up_scale,
+                down_weights_scale=down_scale,
+                expert_affinities_scaling_mode=scaling_mode,
+            )
+        else:
+            # Fallback to non-kernel path
+            seq_len = hidden_states_shape[1]  # assuming (B, S, H)
+            output = self.expert_mlps(
+                hidden_states=hidden_states,
+                expert_affinities=expert_affinities,
+                expert_index=expert_index,
+                seq_len=seq_len,
+            )
+
+        return output.view(hidden_states_shape)
+
+    import types
+    tkg._expert_mlp = types.MethodType(_expert_mlp_fp8, tkg)
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 logger = logging.getLogger(__name__)
@@ -1009,6 +1103,11 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
                 sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
                 sequence_dimension=1,
             )
+
+        # Patch MoE expert MLP to pass FP8 scales when quantized
+        if not self.is_dense_layer and self.moe_fused_nki_kernel_enabled:
+            if getattr(config.neuron_config, "quantized", False):
+                _patch_moe_expert_mlp_for_fp8(self.mlp)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
