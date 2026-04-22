@@ -91,10 +91,18 @@ def _patch_moe_expert_mlp_for_fp8(moe_module):
     original_expert_mlp = tkg._expert_mlp.__func__  # unbound method
 
     def _expert_mlp_fp8(self, hidden_states, expert_affinities, expert_index):
+        """Expert MLP with FP8 scale passthrough.
+
+        Bypasses the framework's _can_use_nki_kernel gate (which disables
+        individual kernels due to a compiler regression) and calls the
+        underlying NKI expert_mlps kernel directly with FP8 scale tensors.
+        """
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states_shape[-1])
 
-        if self._can_use_nki_kernel("expert_mlp", hidden_states):
+        on_device = hidden_states.device.type != "cpu"
+
+        if on_device:
             grid = (nc(self.logical_nc_config),)
             if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
                 scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
@@ -115,7 +123,6 @@ def _patch_moe_expert_mlp_for_fp8(moe_module):
             if down_scale is not None:
                 down_scale = down_scale.view(self.num_local_experts, -1)
 
-            # Wrapper that passes scales to the underlying NKI kernel
             def _expert_kernel_with_scales(
                 inp, gate_up_weights, down_weights,
                 expert_affinities, expert_index,
@@ -146,8 +153,7 @@ def _patch_moe_expert_mlp_for_fp8(moe_module):
                 expert_affinities_scaling_mode=scaling_mode,
             )
         else:
-            # Fallback to non-kernel path
-            seq_len = hidden_states_shape[1]  # assuming (B, S, H)
+            seq_len = hidden_states_shape[1]
             output = self.expert_mlps(
                 hidden_states=hidden_states,
                 expert_affinities=expert_affinities,
