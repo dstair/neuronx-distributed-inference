@@ -106,41 +106,52 @@ def _dequantize_fp8_state_dict(state_dict: dict, block_size: int = 128) -> dict:
     return state_dict
 
 
+def _is_fp8_preprocessed(state_dict: dict, first_moe_layer: int) -> bool:
+    """Check if the state dict was preprocessed by preprocess_fp8.py."""
+    return f"layers.{first_moe_layer}.mlp.experts.gate_up_proj.weight" in state_dict
+
+
 def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "DeepseekV3InferenceConfig") -> dict:
     """
     Convert HuggingFace DeepSeek V3 state dict to Neuron-compatible format.
 
-    Transformations:
-    0. Dequantize FP8 weights to BF16 (if present)
+    Supports two input formats:
+    A) Raw HF checkpoint (with per-expert FP8 weights + block-wise scales)
+       -> dequantizes to BF16, fuses gate/up, stacks experts
+    B) Preprocessed FP8 checkpoint (from preprocess_fp8.py)
+       -> keeps FP8 weights + per-tensor scales, just renames keys
+
+    Transformations (both paths):
     1. Add rank utility tensors for TP sharding
     2. Rename router weights: gate.weight -> router.linear_router.weight
     3. Rename e_score_correction_bias -> router.e_score_correction_bias
-    4. Fuse gate_proj + up_proj into gate_up_proj for each expert
-    5. Stack down_proj weights across experts
-    6. Skip dense layers (first_k_dense_replace layers)
+    4. Fuse/rename gate_up_proj and down_proj for experts
     """
-    # Dequantize FP8 weights if present (DeepSeek V3 native FP8 format)
-    quant_config = getattr(config, "quantization_config", None)
-    if quant_config is None:
-        # Check the underlying HF config for quantization_config
-        load_config = getattr(config, "_load_config", None)
-        if load_config:
-            quant_config = getattr(load_config, "quantization_config", None)
-    block_size = 128
-    if quant_config and isinstance(quant_config, dict):
-        wbs = quant_config.get("weight_block_size", [128, 128])
-        block_size = wbs[0] if isinstance(wbs, (list, tuple)) else wbs
-    _dequantize_fp8_state_dict(state_dict, block_size=block_size)
-
     num_hidden_layers = config.num_hidden_layers
     num_local_experts = config.num_local_experts
     tp_degree = getattr(config.neuron_config, "tp_degree", 1)
     first_k_dense = getattr(config, "first_k_dense_replace", 3)
+    has_indexer = getattr(config, "has_indexer", False)
+
+    fp8_preprocessed = _is_fp8_preprocessed(state_dict, first_k_dense)
+
+    if not fp8_preprocessed:
+        # Path A: raw HF checkpoint — dequantize FP8 to BF16
+        quant_config = getattr(config, "quantization_config", None)
+        if quant_config is None:
+            load_config = getattr(config, "_load_config", None)
+            if load_config:
+                quant_config = getattr(load_config, "quantization_config", None)
+        block_size = 128
+        if quant_config and isinstance(quant_config, dict):
+            wbs = quant_config.get("weight_block_size", [128, 128])
+            block_size = wbs[0] if isinstance(wbs, (list, tuple)) else wbs
+        _dequantize_fp8_state_dict(state_dict, block_size=block_size)
+    else:
+        logger.info("Detected FP8-preprocessed checkpoint, keeping FP8 expert weights.")
 
     # Add rank utilities for TP
     state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
-
-    has_indexer = getattr(config, "has_indexer", False)
 
     for layer_idx in range(num_hidden_layers):
         # Add rank utility for attention
@@ -150,12 +161,9 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
 
         # DSA Indexer weight handling (V3.2 only)
         if has_indexer:
-            # Add rank utility for the indexer's ColumnParallelLinear layers
             state_dict[f"layers.{layer_idx}.self_attn.indexer.rank_util.rank"] = torch.arange(
                 0, tp_degree, dtype=torch.int32
             )
-            # The indexer's weights_proj is stored as BF16 in the HF checkpoint
-            # but used as FP32 in the model. Cast if present.
             wp_key = f"layers.{layer_idx}.self_attn.indexer.weights_proj.weight"
             if wp_key in state_dict and state_dict[wp_key].dtype != torch.float32:
                 state_dict[wp_key] = state_dict[wp_key].to(torch.float32)
@@ -164,68 +172,65 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
         if layer_idx < first_k_dense:
             continue
 
-        # Rename router weights: gate.weight -> router.linear_router.weight
+        # Rename router weights
         router_key = f"layers.{layer_idx}.mlp.gate.weight"
         if router_key in state_dict:
             state_dict[f"layers.{layer_idx}.mlp.router.linear_router.weight"] = (
-                state_dict[router_key].detach().clone()
+                state_dict.pop(router_key).detach().clone()
             )
-            del state_dict[router_key]
 
-        # Rename e_score_correction_bias for GroupLimitedRouter
         bias_key = f"layers.{layer_idx}.mlp.gate.e_score_correction_bias"
         if bias_key in state_dict:
             state_dict[f"layers.{layer_idx}.mlp.router.e_score_correction_bias"] = (
-                state_dict[bias_key].detach().clone()
+                state_dict.pop(bias_key).detach().clone()
             )
-            del state_dict[bias_key]
 
-        # Check if expert weights exist for this layer
-        expert_gate_key = f"layers.{layer_idx}.mlp.experts.0.gate_proj.weight"
-        if expert_gate_key not in state_dict:
-            continue
+        if fp8_preprocessed:
+            # Path B: preprocessed — just rename the already-fused keys
+            for suffix in ["weight", "scale"]:
+                src = f"layers.{layer_idx}.mlp.experts.gate_up_proj.{suffix}"
+                dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.{suffix}"
+                if src in state_dict:
+                    state_dict[dst] = state_dict.pop(src)
 
-        intermediate_size, hidden_size = state_dict[expert_gate_key].shape
-        device = state_dict[expert_gate_key].device
-        dtype = state_dict[expert_gate_key].dtype
+                src = f"layers.{layer_idx}.mlp.experts.down_proj.{suffix}"
+                dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.{suffix}"
+                if src in state_dict:
+                    state_dict[dst] = state_dict.pop(src)
+        else:
+            # Path A: raw HF — fuse gate/up and stack experts
+            expert_gate_key = f"layers.{layer_idx}.mlp.experts.0.gate_proj.weight"
+            if expert_gate_key not in state_dict:
+                continue
 
-        # Fuse gate_proj + up_proj into gate_up_proj for all experts
-        gate_up_proj = torch.empty(
-            num_local_experts, hidden_size, 2 * intermediate_size,
-            dtype=dtype, device=device,
-        )
+            intermediate_size, hidden_size = state_dict[expert_gate_key].shape
+            device = state_dict[expert_gate_key].device
+            dtype = state_dict[expert_gate_key].dtype
 
-        for e in range(num_local_experts):
-            gate_key = f"layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight"
-            up_key = f"layers.{layer_idx}.mlp.experts.{e}.up_proj.weight"
+            gate_up_proj = torch.empty(
+                num_local_experts, hidden_size, 2 * intermediate_size,
+                dtype=dtype, device=device,
+            )
+            for e in range(num_local_experts):
+                gate_key = f"layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight"
+                up_key = f"layers.{layer_idx}.mlp.experts.{e}.up_proj.weight"
+                if gate_key in state_dict and up_key in state_dict:
+                    gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
+                    torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size).copy_(state_dict[gate_key].T)
+                    torch.narrow(gate_up_proj_slice, 2, intermediate_size, intermediate_size).copy_(state_dict[up_key].T)
+                    del state_dict[gate_key], state_dict[up_key]
+            state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
 
-            if gate_key in state_dict and up_key in state_dict:
-                gate_proj_weights = state_dict[gate_key].T.detach().clone()
-                up_proj_weights = state_dict[up_key].T.detach().clone()
-
-                gate_up_proj_slice = torch.narrow(gate_up_proj, 0, e, 1)
-                torch.narrow(gate_up_proj_slice, 2, 0, intermediate_size).copy_(gate_proj_weights)
-                torch.narrow(gate_up_proj_slice, 2, intermediate_size, intermediate_size).copy_(up_proj_weights)
-
-                del state_dict[gate_key]
-                del state_dict[up_key]
-
-        state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up_proj
-
-        # Stack down_proj weights across all experts
-        down_proj = torch.empty(
-            num_local_experts, intermediate_size, hidden_size,
-            dtype=dtype, device=device,
-        )
-
-        for e in range(num_local_experts):
-            down_key = f"layers.{layer_idx}.mlp.experts.{e}.down_proj.weight"
-            if down_key in state_dict:
-                down_proj_weights = state_dict[down_key].T.detach().clone()
-                torch.narrow(down_proj, 0, e, 1).copy_(down_proj_weights)
-                del state_dict[down_key]
-
-        state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
+            down_proj = torch.empty(
+                num_local_experts, intermediate_size, hidden_size,
+                dtype=dtype, device=device,
+            )
+            for e in range(num_local_experts):
+                down_key = f"layers.{layer_idx}.mlp.experts.{e}.down_proj.weight"
+                if down_key in state_dict:
+                    torch.narrow(down_proj, 0, e, 1).copy_(state_dict[down_key].T)
+                    del state_dict[down_key]
+            state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
         gc.collect()
 
@@ -345,6 +350,11 @@ class DeepseekV3InferenceConfig(InferenceConfig):
         # Disable numeric CC token (workaround for all-gather/reduce-scatter)
         self.neuron_config.disable_numeric_cc_token = True
 
+        # FP8 inference: when quantized_mlp_kernel_enabled is set, ensure
+        # the quantized flag is also set so the MoE TKG module picks it up.
+        if getattr(self.neuron_config, "quantized_mlp_kernel_enabled", False):
+            self.neuron_config.quantized = True
+
         # DSA (DeepSeek Sparse Attention) parameters — present in V3.2, absent in V3.0
         self.has_indexer = hasattr(self, "index_n_heads") and getattr(self, "index_n_heads", 0) > 0
         if not hasattr(self, "index_n_heads"):
@@ -390,7 +400,7 @@ def get_rmsnorm_cls():
     return LlamaRMSNorm if cpu_mode() else CustomRMSNorm
 
 
-def custom_compiler_args():
+def custom_compiler_args(quantized=False):
     """
     Compiler flags for DeepSeek V3 on Neuron (standalone function for attention tests).
     """
@@ -398,6 +408,8 @@ def custom_compiler_args():
     compiler_args += " --tensorizer-options='--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2'"
     compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
     compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
+    if quantized:
+        compiler_args += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
     return compiler_args
 
 
