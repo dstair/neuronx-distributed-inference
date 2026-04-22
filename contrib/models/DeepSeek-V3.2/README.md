@@ -160,6 +160,21 @@ Measured with 20 timed iterations after 3 warmup iterations.
 | 128 | 32 | PASS | PASS | **PASS** | Default, all benchmarks |
 | 128 | 128 | PASS | HBM OOM | **FAIL** | CTE scratchpad + TKG > 24GB per NC pair |
 
+**Why V3.2 supports shorter sequences than V3.0:** The DSA Indexer adds significant per-layer HBM overhead:
+
+| Component | V3.0 | V3.2 | Delta |
+|-----------|------|------|-------|
+| KV cache head_dim | 576 | 704 | +22% (indexer keys stored in cache) |
+| Indexer `wk` weight (replicated) | — | 128×7168 per layer × 61 layers | ~110 MB/NC |
+| Indexer `wq_b`, `weights_proj`, `k_norm` | — | ~2 MB/layer (TP-sharded) | ~8 MB/NC |
+
+V3.0's TKG model used ~23.1 GB of the 24 GB HBM per NC pair, leaving ~900 MB headroom. The DSA Indexer's replicated `wk` weights (~110 MB) plus the 22% larger KV cache consume most of this headroom, causing OOM at larger CTE bucket sizes. V3.0 could run seq_len=512 with CTE bucket=256; V3.2 is limited to seq_len=128 with CTE bucket=32.
+
+Potential mitigations:
+- Shard the indexer's `wk` weight across TP ranks (currently replicated)
+- Reduce CTE scratchpad allocation in the compiler
+- FP8 expert weights (when supported) would free ~50% of expert HBM, creating room for larger contexts
+
 ## Usage
 
 ### Full 671B Model (trn2.48xlarge, TP=64)
@@ -195,8 +210,9 @@ model.load(compiled_path)     # Subsequent: ~53s from NVMe
 3. **FP8 dequantization** — Requires ~2TB RAM + NVMe swap. Use trn2.48xlarge's 4x 1.7TB NVMe drives as RAID0 + swap.
 4. **MLA incompatible with NeuronAttentionBase** — Custom attention class required.
 5. **`save_sharded_checkpoint=True` strongly recommended** — Avoids re-sharding 1.3TB on every load.
-6. **DSA Indexer increases KV cache** — head_dim grows from 576 (V3.0) to 704 (V3.2) due to indexer key storage.
+6. **DSA Indexer increases KV cache** — head_dim grows from 576 (V3.0) to 704 (V3.2) due to indexer key storage. Combined with replicated indexer `wk` weights (~110 MB/NC across 61 layers), this reduces HBM headroom and limits maximum sequence length compared to V3.0.
 7. **FP8 inference blocked** — Fused TKG MoE kernel cannot handle shared expert dim mismatch (2048 vs 18432). Preprocessed FP8 weights ready in S3 for future use.
+8. **Thinking/reasoning mode not validated** — DeepSeek V3.2 supports chain-of-thought reasoning via `<think>...</think>` tags, but this requires much larger sequence lengths (4096+) than currently supported. seq_len=512 may work for short reasoning chains but has not been tested with V3.2 due to HBM constraints.
 
 ## Compatibility Matrix
 
