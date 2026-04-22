@@ -47,6 +47,7 @@ from neuronx_distributed_inference.models.layer_boundary_marker import (
 from src.rope_util import (
     DeepseekV3YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+    apply_rotary_pos_emb_non_interleaved,
 )
 from neuronx_distributed_inference.modules.attention.utils import manual_softmax
 from neuronx_distributed_inference.modules.custom_calls import CustomRMSNorm
@@ -139,11 +140,25 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
     # Add rank utilities for TP
     state_dict["rank_util.rank"] = torch.arange(0, tp_degree, dtype=torch.int32)
 
+    has_indexer = getattr(config, "has_indexer", False)
+
     for layer_idx in range(num_hidden_layers):
         # Add rank utility for attention
         state_dict[f"layers.{layer_idx}.self_attn.rank_util.rank"] = torch.arange(
             0, tp_degree, dtype=torch.int32
         )
+
+        # DSA Indexer weight handling (V3.2 only)
+        if has_indexer:
+            # Add rank utility for the indexer's ColumnParallelLinear layers
+            state_dict[f"layers.{layer_idx}.self_attn.indexer.rank_util.rank"] = torch.arange(
+                0, tp_degree, dtype=torch.int32
+            )
+            # The indexer's weights_proj is stored as BF16 in the HF checkpoint
+            # but used as FP32 in the model. Cast if present.
+            wp_key = f"layers.{layer_idx}.self_attn.indexer.weights_proj.weight"
+            if wp_key in state_dict and state_dict[wp_key].dtype != torch.float32:
+                state_dict[wp_key] = state_dict[wp_key].to(torch.float32)
 
         # Skip dense layers (no MoE conversion needed)
         if layer_idx < first_k_dense:
@@ -330,10 +345,21 @@ class DeepseekV3InferenceConfig(InferenceConfig):
         # Disable numeric CC token (workaround for all-gather/reduce-scatter)
         self.neuron_config.disable_numeric_cc_token = True
 
+        # DSA (DeepSeek Sparse Attention) parameters — present in V3.2, absent in V3.0
+        self.has_indexer = hasattr(self, "index_n_heads") and getattr(self, "index_n_heads", 0) > 0
+        if not hasattr(self, "index_n_heads"):
+            self.index_n_heads = 0
+        if not hasattr(self, "index_head_dim"):
+            self.index_head_dim = 0
+        if not hasattr(self, "index_topk"):
+            self.index_topk = 0
+
         # MLA KV cache: override head_dim and num_key_value_heads so the
-        # KVCacheManager allocates (bsz, 1, max_len, rope_dim + kv_lora_rank)
-        # instead of standard GQA layout.
+        # KVCacheManager allocates (bsz, 1, max_len, combined_dim).
+        # For V3.2 the indexer's processed keys are appended to the cache.
         self.head_dim = self.qk_rope_head_dim + self.kv_lora_rank
+        if self.has_indexer:
+            self.head_dim += self.index_head_dim
         self.num_key_value_heads = 1
 
     def add_derived_config(self):
@@ -414,6 +440,191 @@ class DeepseekV3DenseMLP(nn.Module):
             self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
         )
         return (output,)
+
+
+def _get_hadamard_matrix(n: int) -> torch.Tensor:
+    """Construct n×n Hadamard matrix via Sylvester's construction. n must be a power of 2."""
+    assert n > 0 and (n & (n - 1)) == 0, f"n must be a power of 2, got {n}"
+    if n == 1:
+        return torch.tensor([[1.0]])
+    H_half = _get_hadamard_matrix(n // 2)
+    return torch.cat([
+        torch.cat([H_half, H_half], dim=1),
+        torch.cat([H_half, -H_half], dim=1),
+    ], dim=0)
+
+
+class DeepseekV3Indexer(nn.Module):
+    """
+    DeepSeek Sparse Attention (DSA) Indexer for V3.2.
+
+    Computes relevance scores for each query token against all past tokens,
+    then selects the top-k most relevant positions. The MLA attention layer
+    uses the resulting indices as a sparse mask.
+
+    Key differences from the reference CUDA implementation:
+    - BF16 scoring instead of FP8 (no act_quant / fp8_index kernels)
+    - Hadamard transform via precomputed matrix multiply instead of fast_hadamard_transform
+    - Non-interleaved RoPE (same as reference, different from MLA's interleaved RoPE)
+    - TP sharding: wq_b and weights_proj are ColumnParallel; wk is replicated;
+      index_score is all-reduced across TP ranks.
+    """
+
+    def __init__(self, config, tensor_model_parallel_group=None):
+        super().__init__()
+        self.dim = config.hidden_size
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
+        self.q_lora_rank = config.q_lora_rank
+        self.tp_degree = config.neuron_config.tp_degree
+        self.tensor_model_parallel_group = tensor_model_parallel_group
+        self.softmax_scale = self.head_dim ** -0.5
+
+        dtype = config.neuron_config.torch_dtype
+
+        if cpu_mode():
+            self.n_local_heads = self.n_heads
+        else:
+            assert self.n_heads % self.tp_degree == 0, (
+                f"index_n_heads ({self.n_heads}) must be divisible by tp_degree ({self.tp_degree})"
+            )
+            self.n_local_heads = self.n_heads // self.tp_degree
+
+        # Q projection: q_lora_rank -> index_n_heads * index_head_dim
+        if tensor_model_parallel_group is not None:
+            self.wq_b = ColumnParallelLinear(
+                self.q_lora_rank, self.n_heads * self.head_dim,
+                bias=False, gather_output=False, dtype=dtype,
+                tensor_model_parallel_group=tensor_model_parallel_group,
+            )
+        else:
+            self.wq_b = nn.Linear(
+                self.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=dtype,
+            )
+
+        # K projection: dim -> index_head_dim (replicated, single head shared across ranks)
+        self.wk = nn.Linear(self.dim, self.head_dim, bias=False, dtype=dtype)
+
+        # K normalization — LayerNorm (NOT RMSNorm), matching reference
+        self.k_norm = nn.LayerNorm(self.head_dim)
+
+        # Per-head weights for scoring: dim -> index_n_heads
+        if tensor_model_parallel_group is not None:
+            self.weights_proj = ColumnParallelLinear(
+                self.dim, self.n_heads,
+                bias=False, gather_output=False, dtype=torch.float32,
+                tensor_model_parallel_group=tensor_model_parallel_group,
+            )
+        else:
+            self.weights_proj = nn.Linear(
+                self.dim, self.n_heads, bias=False, dtype=torch.float32,
+            )
+
+        # Precomputed Hadamard matrix (constant, scaled by dim^-0.5)
+        H = _get_hadamard_matrix(self.head_dim) * (self.head_dim ** -0.5)
+        self.register_buffer("hadamard_matrix", H.to(dtype=dtype), persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        position_ids: torch.Tensor,
+        cos_cache: torch.Tensor,
+        sin_cache: torch.Tensor,
+        is_prefill: bool,
+        past_indexer_k: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute top-k indices for sparse attention masking.
+
+        Args:
+            x: hidden_states (bsz, seqlen, dim)
+            qr: compressed query from MLA's q_a_proj + q_a_layernorm (bsz, seqlen, q_lora_rank)
+            position_ids: (bsz, seqlen)
+            cos_cache, sin_cache: precomputed RoPE tables
+            is_prefill: True for context encoding, False for token generation
+            past_indexer_k: (bsz, prior_len, index_head_dim) from KV cache, decode only
+
+        Returns:
+            topk_indices: (bsz, seqlen, topk) positions selected by the indexer
+            processed_k: (bsz, seqlen, index_head_dim) to store in KV cache
+        """
+        bsz, seqlen, _ = x.size()
+
+        # --- Q path ---
+        q = self.wq_b(qr)  # (bsz, seqlen, n_local_heads * head_dim)
+        q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        q_pe = q[..., : self.rope_head_dim]
+        q_nope = q[..., self.rope_head_dim :]
+        q_pe = apply_rotary_pos_emb_non_interleaved(q_pe, cos_cache, sin_cache, position_ids)
+        q = torch.cat([q_pe, q_nope], dim=-1)
+
+        # --- K path ---
+        k = self.wk(x)  # (bsz, seqlen, head_dim)
+        k = self.k_norm(k)
+        k_pe = k[..., : self.rope_head_dim]
+        k_nope = k[..., self.rope_head_dim :]
+        k_pe = apply_rotary_pos_emb_non_interleaved(
+            k_pe.unsqueeze(2), cos_cache, sin_cache, position_ids
+        ).squeeze(2)
+        k = torch.cat([k_pe, k_nope], dim=-1)
+
+        # --- Hadamard transform ---
+        q = q @ self.hadamard_matrix  # (bsz, seqlen, n_local_heads, head_dim)
+        k = k @ self.hadamard_matrix  # (bsz, seqlen, head_dim)
+
+        # Save processed k for KV cache (returned to caller)
+        processed_k = k  # (bsz, seqlen, head_dim)
+
+        # --- Assemble keys for scoring ---
+        if is_prefill:
+            k_for_scoring = k  # (bsz, seqlen, head_dim)
+        else:
+            # Decode: concatenate cached prior keys with current key
+            k_for_scoring = torch.cat([past_indexer_k, k], dim=1)  # (bsz, end_pos, head_dim)
+
+        # --- Compute per-head weights ---
+        weights = self.weights_proj(x.float()) * (self.n_heads ** -0.5)  # (bsz, seqlen, n_local_heads)
+
+        # --- BF16 indexer scoring (replaces FP8 fp8_index kernel) ---
+        # qk[b,s,h,t] = sum_d(q[b,s,h,d] * k[b,t,d])
+        qk = torch.einsum("bshd,btd->bsht", q, k_for_scoring) * self.softmax_scale
+        qk = torch.relu(qk)
+        # Weighted sum across local heads (FP32 for precision — weights are FP32)
+        index_score = torch.einsum("bsht,bsh->bst", qk.float(), weights)  # (bsz, seqlen, kv_len)
+
+        # --- All-reduce across TP ranks (sum partial head contributions) ---
+        if self.tensor_model_parallel_group is not None and self.tp_degree > 1:
+            torch.distributed.all_reduce(
+                index_score,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.tensor_model_parallel_group,
+            )
+
+        # --- Mask invalid positions ---
+        if is_prefill:
+            # Causal mask: can't attend to future positions
+            causal_mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=x.device, dtype=index_score.dtype,
+            ).triu_(1)
+            index_score = index_score + causal_mask.unsqueeze(0)
+        else:
+            # Decode: no masking needed — k_for_scoring already has exactly end_pos entries
+            pass
+
+        # --- Top-k selection ---
+        kv_len = index_score.shape[-1]
+        k_val = min(self.index_topk, kv_len)
+        if k_val >= kv_len:
+            # All positions selected — skip topk (torch.topk compiles to sort
+            # HLO which is not supported on trn2; unnecessary when selecting all)
+            topk_indices = torch.arange(kv_len, device=x.device).unsqueeze(0).unsqueeze(0).expand(bsz, seqlen, -1)
+        else:
+            topk_indices = index_score.topk(k_val, dim=-1)[1]  # (bsz, seqlen, topk)
+
+        return topk_indices, processed_k
 
 
 class DeepseekV3Attention(nn.Module):
@@ -499,6 +710,14 @@ class DeepseekV3Attention(nn.Module):
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        # DSA Indexer (V3.2 only)
+        self.has_indexer = getattr(config, "has_indexer", False)
+        if self.has_indexer:
+            self.indexer = DeepseekV3Indexer(
+                config, tensor_model_parallel_group=self.tensor_model_parallel_group,
+            )
+            self.index_head_dim = config.index_head_dim
+
     def init_mla_properties(self):
         config = self.config
         dtype = self.torch_dtype
@@ -578,10 +797,10 @@ class DeepseekV3Attention(nn.Module):
     ):
         """Implements each layer's forward pass for the attention block."""
         # On decode, past_key_value comes from KVCacheManager as [k_cache, v_cache]
-        # each shaped (bsz, 1, seq_len, qk_rope_head_dim + kv_lora_rank).
+        # each shaped (bsz, 1, seq_len, combined_head_dim).
         # Convert to the single concatenated tensor that the decode path expects.
         if past_key_value is not None and isinstance(past_key_value, (list, tuple)):
-            combined = past_key_value[0].squeeze(1)  # (bsz, seq_len, rope_dim + kv_lora_rank)
+            combined = past_key_value[0].squeeze(1)  # (bsz, seq_len, combined_dim)
             past_key_value = combined
 
         if self.sequence_parallel_enabled and self.tensor_model_parallel_group is not None:
@@ -599,10 +818,13 @@ class DeepseekV3Attention(nn.Module):
 
         out_absorb = wkv_b[:, self.v_head_dim:, :]
 
+        # Compute compressed query (qr) — needed for both MLA Q and Indexer
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
+            qr = None
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            qr = self.q_a_layernorm(self.q_a_proj(hidden_states))
+            q = self.q_b_proj(qr)
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
@@ -628,7 +850,23 @@ class DeepseekV3Attention(nn.Module):
         active_scores = torch.matmul(q_pe, k_pe.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv)
         active_scores *= self.softmax_scale
 
+        # --- Prefill path ---
         if past_key_value is None:
+            # DSA: compute indexer sparse mask (V3.2 only)
+            if self.has_indexer and qr is not None:
+                topk_indices, indexer_k = self.indexer(
+                    hidden_states, qr, position_ids, cos_cache, sin_cache,
+                    is_prefill=True,
+                )
+                # Create sparse mask: -inf everywhere except topk positions
+                index_mask = torch.full(
+                    (bsz, 1, q_len, q_len), float("-inf"),
+                    device=hidden_states.device, dtype=active_scores.dtype,
+                )
+                # topk_indices: (bsz, q_len, topk) -> (bsz, 1, q_len, topk) for 4D scatter
+                index_mask.scatter_(-1, topk_indices.unsqueeze(1), 0.0)
+                active_scores = active_scores + index_mask
+
             active_scores = torch.where(attention_mask, active_scores, torch.finfo(active_scores.dtype).min)
             active_scores = nn.functional.softmax(active_scores, dim=-1, dtype=torch.float32).to(
                 k_pe.dtype
@@ -637,13 +875,44 @@ class DeepseekV3Attention(nn.Module):
             # attention result with V absorb
             x = torch.einsum("bhql,blc->bhqc", active_scores, compressed_kv)
             attn_output = torch.einsum("bhqc,hdc->bhqd", x, out_absorb)
+
+        # --- Decode path ---
         else:
-            k_pe_prior, compressed_kv_prior = torch.tensor_split(past_key_value, [self.qk_rope_head_dim,], dim=-1)
+            # Split prior cache into MLA components (and indexer k if V3.2)
+            if self.has_indexer:
+                mla_dim = self.qk_rope_head_dim + self.kv_lora_rank
+                k_pe_prior = past_key_value[..., : self.qk_rope_head_dim]
+                compressed_kv_prior = past_key_value[..., self.qk_rope_head_dim : mla_dim]
+                indexer_k_prior = past_key_value[..., mla_dim :]
+            else:
+                k_pe_prior, compressed_kv_prior = torch.tensor_split(
+                    past_key_value, [self.qk_rope_head_dim], dim=-1,
+                )
+                indexer_k_prior = None
             k_pe_prior = k_pe_prior.reshape(bsz, 1, compressed_kv_prior.shape[1], self.qk_rope_head_dim)
 
-            # I. scores and softmax
+            # I. scores
             prior_scores = torch.matmul(q_pe, k_pe_prior.transpose(2, 3)) + torch.einsum('bhqc,blc->bhql', q_nope, compressed_kv_prior)
             prior_scores *= self.softmax_scale
+
+            # DSA: compute indexer sparse mask and apply to combined scores
+            if self.has_indexer and qr is not None:
+                topk_indices, indexer_k = self.indexer(
+                    hidden_states, qr, position_ids, cos_cache, sin_cache,
+                    is_prefill=False, past_indexer_k=indexer_k_prior,
+                )
+                # Build mask over all positions [prior | active]
+                prior_len = prior_scores.shape[-1]
+                end_pos = prior_len + 1
+                full_mask = torch.full(
+                    (bsz, 1, 1, end_pos), float("-inf"),
+                    device=hidden_states.device, dtype=prior_scores.dtype,
+                )
+                full_mask.scatter_(-1, topk_indices.unsqueeze(1), 0.0)
+                # Split mask for prior and active
+                prior_scores = prior_scores + full_mask[..., :prior_len]
+                active_scores = active_scores + full_mask[..., prior_len:]
+
             prior_scores = torch.where(
                 attention_mask, prior_scores, torch.finfo(prior_scores.dtype).min
             )
@@ -671,7 +940,11 @@ class DeepseekV3Attention(nn.Module):
         # Concatenate k_pe and compressed_kv into combined format for KVCacheManager.
         # KVCacheManager expects (key, value) tuple each shaped (bsz, 1, seq_len, head_dim).
         # For MLA, we store [k_pe | compressed_kv] in both slots (V is duplicate).
-        combined = torch.cat([k_pe.squeeze(1), compressed_kv], dim=-1).unsqueeze(1)
+        # For V3.2, also store the indexer's processed key: [k_pe | compressed_kv | indexer_k].
+        cache_parts = [k_pe.squeeze(1), compressed_kv]
+        if self.has_indexer:
+            cache_parts.append(indexer_k)
+        combined = torch.cat(cache_parts, dim=-1).unsqueeze(1)
         past_key_value = (combined, combined)
 
         return attn_output, past_key_value, cos_cache, sin_cache

@@ -155,3 +155,40 @@ def apply_rotary_pos_emb(q: torch.Tensor, cos, sin, position_ids):
 
     q_embed = (q * cos) + rotate_fn(q) * sin
     return q_embed.to(q.dtype)
+
+
+def apply_rotary_pos_emb_non_interleaved(x: torch.Tensor, cos, sin, position_ids):
+    """
+    Non-interleaved (split-half) RoPE for the DeepSeek V3.2 Indexer.
+
+    Unlike apply_rotary_pos_emb which uses interleaved layout (pairs at
+    alternating indices), this splits x into first and second halves.
+    The Indexer's RoPE uses this non-interleaved convention.
+
+    Works with any input layout as long as the last dim is the RoPE dim.
+    Typical inputs:
+        q: (bsz, seqlen, n_heads, rope_dim)   — BSHD
+        k: (bsz, seqlen, 1, rope_dim)         — BSD1 (unsqueezed)
+    """
+    # Extract unique freqs (cos/sin stored as [freqs, freqs] concatenated)
+    cos_half = cos.chunk(2, dim=-1)[0][position_ids]  # (bsz, seq_len, dim//2)
+    sin_half = sin.chunk(2, dim=-1)[0][position_ids]  # (bsz, seq_len, dim//2)
+    # Take first batch for broadcasting (matches existing apply_rotary_pos_emb pattern)
+    cos_half = cos_half[0]  # (seq_len, dim//2)
+    sin_half = sin_half[0]  # (seq_len, dim//2)
+
+    # Add singleton dims for broadcasting with multi-head inputs (BSHD layout)
+    # 3D input (bsz, seq, d): no extra dim needed
+    # 4D input (bsz, seq, heads, d): need one unsqueeze for heads
+    for _ in range(x.dim() - 3):
+        cos_half = cos_half.unsqueeze(-2)
+        sin_half = sin_half.unsqueeze(-2)
+
+    d = x.shape[-1]
+    x1 = x[..., : d // 2]
+    x2 = x[..., d // 2 :]
+    result = torch.cat([
+        x1 * cos_half - x2 * sin_half,
+        x2 * cos_half + x1 * sin_half,
+    ], dim=-1)
+    return result.to(x.dtype)
