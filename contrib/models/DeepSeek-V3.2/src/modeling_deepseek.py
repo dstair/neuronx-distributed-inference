@@ -65,10 +65,23 @@ from transformers.activations import ACT2FN
 # through, enabling FP8 expert weights for DeepSeek's MoE layers.
 
 def _patch_moe_expert_mlp_for_fp8(moe_module):
-    """Monkey-patch MoEFusedTKG._expert_mlp to pass FP8 scale tensors."""
+    """Monkey-patch MoEFusedTKG._expert_mlp to pass FP8 scale tensors.
+
+    Also registers scale buffers on the expert modules so that state dict
+    loading will populate them from the preprocessed FP8 checkpoint keys
+    (e.g. mlp_op.gate_up_proj.scale, mlp_op.down_proj.scale).
+    """
     tkg = getattr(moe_module, "tkg_module", None)
     if tkg is None:
         return
+
+    # Register scale buffers so state dict loading picks up .scale keys
+    mlp_op = tkg.expert_mlps.mlp_op
+    E = mlp_op.gate_up_proj.weight.shape[0]  # num_experts
+    I2 = mlp_op.gate_up_proj.weight.shape[-1]  # 2 * intermediate_size
+    H = mlp_op.down_proj.weight.shape[-1]  # hidden_size
+    mlp_op.gate_up_proj.register_buffer("scale", torch.ones(E, I2, dtype=torch.float32))
+    mlp_op.down_proj.register_buffer("scale", torch.ones(E, H, dtype=torch.float32))
 
     from neuronx_distributed.modules.moe.moe_fused_tkg import (
         nki_components, ExpertAffinityScaleMode, nc,
@@ -94,16 +107,13 @@ def _patch_moe_expert_mlp_for_fp8(moe_module):
             )
             down_weights = self.expert_mlps.mlp_op.down_proj.weight
 
-            # FP8 scales (None when not quantized)
-            gate_up_scale = None
-            down_scale = None
-            if getattr(self.config, "quantized", False):
-                gate_up_scale = self.expert_mlps.mlp_op.gate_up_proj.scale.view(
-                    self.num_local_experts, 2, -1
-                )
-                down_scale = self.expert_mlps.mlp_op.down_proj.scale.view(
-                    self.num_local_experts, -1
-                )
+            # FP8 scales (populated by state dict loading from preprocessed checkpoint)
+            gate_up_scale = getattr(self.expert_mlps.mlp_op.gate_up_proj, "scale", None)
+            down_scale = getattr(self.expert_mlps.mlp_op.down_proj, "scale", None)
+            if gate_up_scale is not None:
+                gate_up_scale = gate_up_scale.view(self.num_local_experts, 2, -1)
+            if down_scale is not None:
+                down_scale = down_scale.view(self.num_local_experts, -1)
 
             # Wrapper that passes scales to the underlying NKI kernel
             def _expert_kernel_with_scales(
@@ -1081,9 +1091,10 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
             eps=config.rms_norm_eps,
         )
 
+        self.use_expert_nki_kernel = getattr(config.neuron_config, "expert_mlp_nki_kernel_enabled", False)
         if self.is_dense_layer:
             self.mlp = DeepseekV3DenseMLP(config)
-        elif self.moe_fused_nki_kernel_enabled:
+        elif self.moe_fused_nki_kernel_enabled or self.use_expert_nki_kernel:
             self.mlp = initialize_moe_module(
                 config=config, rmsnorm=self.post_attention_layernorm, init_tkg_module=True
             )
@@ -1104,10 +1115,10 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
                 sequence_dimension=1,
             )
 
-        # Patch MoE expert MLP to pass FP8 scales when quantized
-        if not self.is_dense_layer and self.moe_fused_nki_kernel_enabled:
-            if getattr(config.neuron_config, "quantized", False):
-                _patch_moe_expert_mlp_for_fp8(self.mlp)
+        # Patch MoE expert MLP to pass FP8 scales
+        if not self.is_dense_layer and (self.moe_fused_nki_kernel_enabled or self.use_expert_nki_kernel):
+            _patch_moe_expert_mlp_for_fp8(self.mlp)
+
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
@@ -1168,7 +1179,7 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
             hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states, padding_mask)[0]
         else:
-            if not self.moe_fused_nki_kernel_enabled:
+            if not (self.moe_fused_nki_kernel_enabled or self.use_expert_nki_kernel):
                 hidden_states = self.post_attention_layernorm(hidden_states)
             is_speculative_decoding = self.config.neuron_config.enable_fused_speculation and (not self.config.neuron_config.is_prefill_stage)
             hidden_states = self.mlp(hidden_states, padding_mask, is_speculative_decoding=is_speculative_decoding)[0]
