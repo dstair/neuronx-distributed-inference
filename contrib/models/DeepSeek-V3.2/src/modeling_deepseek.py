@@ -71,7 +71,7 @@ def _patch_moe_expert_mlp_for_fp8(moe_module):
     loading will populate them from the preprocessed FP8 checkpoint keys
     (e.g. mlp_op.gate_up_proj.scale, mlp_op.down_proj.scale).
     """
-    tkg = getattr(moe_module, "tkg_module", None)
+    tkg = getattr(moe_module, "moe_fused_tkg", None)
     if tkg is None:
         return
 
@@ -343,6 +343,23 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
             state_dict[f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.weight"] = down_proj
 
         gc.collect()
+
+    # When using the TKG module (expert_mlp_nki_kernel_enabled), MoE sub-modules
+    # live under mlp.moe_fused_tkg.* instead of mlp.*.  Remap the keys so the
+    # framework's weight loader can find them.
+    use_tkg = getattr(config.neuron_config, "expert_mlp_nki_kernel_enabled", False) or \
+              getattr(config.neuron_config, "moe_fused_nki_kernel_enabled", False)
+    if use_tkg:
+        _TKG_PREFIXES = ("router.", "expert_mlps.", "shared_experts.")
+        remapped = {}
+        for key in list(state_dict.keys()):
+            for pfx in _TKG_PREFIXES:
+                tag = f".mlp.{pfx}"
+                if tag in key:
+                    new_key = key.replace(tag, f".mlp.moe_fused_tkg.{pfx}")
+                    remapped[new_key] = state_dict.pop(key)
+                    break
+        state_dict.update(remapped)
 
     return state_dict
 
@@ -1109,7 +1126,7 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
 
         # Swap in DeepseekV3Router (GroupLimitedRouter + routed_scaling_factor)
         if not self.is_dense_layer:
-            self.mlp.router = DeepseekV3Router(
+            custom_router = DeepseekV3Router(
                 routed_scaling_factor=getattr(config, "routed_scaling_factor", 2.5),
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
@@ -1120,6 +1137,10 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
                 sequence_parallel_enabled=config.neuron_config.sequence_parallel_enabled,
                 sequence_dimension=1,
             )
+            tkg = getattr(self.mlp, "moe_fused_tkg", None)
+            if tkg is not None:
+                tkg.router = custom_router
+            self.mlp.router = custom_router
 
         # Patch MoE expert MLP to pass FP8 scales
         if not self.is_dense_layer and (self.moe_fused_nki_kernel_enabled or self.use_expert_nki_kernel):
