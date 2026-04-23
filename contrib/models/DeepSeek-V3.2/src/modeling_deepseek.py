@@ -296,17 +296,28 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
             )
 
         if fp8_preprocessed:
-            # Path B: preprocessed — just rename the already-fused keys
-            for suffix in ["weight", "scale"]:
-                src = f"layers.{layer_idx}.mlp.experts.gate_up_proj.{suffix}"
-                dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.gate_up_proj.{suffix}"
-                if src in state_dict:
-                    state_dict[dst] = state_dict.pop(src)
-
-                src = f"layers.{layer_idx}.mlp.experts.down_proj.{suffix}"
-                dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.down_proj.{suffix}"
-                if src in state_dict:
-                    state_dict[dst] = state_dict.pop(src)
+            # Path B: preprocessed — rename keys and dequantize FP8→BF16 using
+            # per-tensor scales (the sharding pipeline doesn't preserve FP8 dtype).
+            for proj in ("gate_up_proj", "down_proj"):
+                w_src = f"layers.{layer_idx}.mlp.experts.{proj}.weight"
+                s_src = f"layers.{layer_idx}.mlp.experts.{proj}.scale"
+                w_dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.{proj}.weight"
+                if w_src in state_dict:
+                    w = state_dict.pop(w_src)
+                    if s_src in state_dict:
+                        s = state_dict.pop(s_src)
+                        # Per-tensor scale: multiply FP8 values by scale to get BF16
+                        # w: (E, ...), s: (E, last_dim) — broadcast over middle dims
+                        w_bf16 = w.to(torch.float32)
+                        if w_bf16.ndim == 3 and s.ndim == 2:
+                            # gate_up: w(E,H,2I) s(E,2I) → s(E,1,2I)
+                            # down:    w(E,I,H)  s(E,H)  → s(E,1,H)
+                            w_bf16 = w_bf16 * s.unsqueeze(1)
+                        else:
+                            w_bf16 = w_bf16 * s
+                        state_dict[w_dst] = w_bf16.to(torch.bfloat16)
+                    else:
+                        state_dict[w_dst] = w.to(torch.bfloat16)
         else:
             # Path A: raw HF — fuse gate/up and stack experts
             expert_gate_key = f"layers.{layer_idx}.mlp.experts.0.gate_proj.weight"
