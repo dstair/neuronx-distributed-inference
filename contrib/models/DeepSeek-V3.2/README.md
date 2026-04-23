@@ -41,14 +41,27 @@ NeuronX Distributed Inference implementation of DeepSeek V3.2, a 671B parameter 
   - BF16 scoring (no FP8 kernels needed for the indexer)
 - **Non-interleaved RoPE for indexer:** The DSA indexer uses standard (non-interleaved) RoPE, different from MLA's interleaved YaRN RoPE
 
-### FP8 Inference (Future Work)
+### FP8 Inference
 
-An FP8 preprocessing pipeline (`src/preprocess_fp8.py`) is included that converts HuggingFace FP8 weights for Neuron:
+The FP8 preprocessing pipeline (`src/preprocess_fp8.py`) converts HuggingFace FP8 weights for Neuron:
 - OCP e4m3fn → Neuron E4M3 rescaling (448/240 factor)
-- Block-wise scales → per-tensor scales for the NKI MoE kernel
+- Block-wise scales → per-tensor scales
 - Fuses gate/up projections while keeping expert weights in FP8
 
-FP8 end-to-end inference is currently blocked by the fused TKG MoE kernel's shared expert dimension mismatch (routed=2048 vs shared=18432). The preprocessed weights are ready for when this limitation is resolved.
+During weight conversion, FP8 expert weights are dequantized to BF16 using their per-tensor scales. This produces numerically correct weights from the FP8 source checkpoint. The `--experimental-unsafe-fp8e4m3fn-as-fp8e4m3` compiler flag is required.
+
+**FP8 vs BF16 comparison:**
+
+| Metric | BF16 | FP8 (dequant→BF16) |
+|--------|------|---------------------|
+| Logit match | 27/27 (100%) | 26/27 (96.3%) |
+| Abs mean diff | 0.097 | 0.181 |
+| Max abs diff | 0.250 | 1.500 |
+| TPOT p50 | 24.3ms | 24.0ms |
+| TTFT p50 | 265ms | 266ms |
+| Load time | 53s | 143s |
+
+Note: True FP8 compute (keeping weights in FP8 on device) is blocked by the NKI MoE kernel's top_k=1 limitation and the fused TKG kernel's shared expert dimension mismatch. The current FP8 path dequantizes to BF16 during weight conversion, so runtime performance is identical to BF16.
 
 ## Test Results
 
@@ -180,7 +193,7 @@ Potential mitigations:
 ### Full 671B Model (trn2.48xlarge, TP=64)
 
 ```python
-import json, torch
+import json, os, torch
 from neuronx_distributed_inference.models.config import MoENeuronConfig
 from src.modeling_deepseek import NeuronDeepseekV3ForCausalLM
 
@@ -203,6 +216,27 @@ model.compile(compiled_path)  # First time: ~13 min compile + hours sharding
 model.load(compiled_path)     # Subsequent: ~53s from NVMe
 ```
 
+### FP8 Source Checkpoint (trn2.48xlarge, TP=64)
+
+To use the FP8 HuggingFace checkpoint (e.g. `deepseek-ai/DeepSeek-V3.2`), first preprocess the weights, then compile with the compiler flag:
+
+```bash
+# Step 1: Preprocess FP8 weights (OCP→Neuron rescaling, block→per-tensor scales)
+python src/preprocess_fp8.py \
+  --input-dir /path/to/DeepSeek-V3.2-FP8/ \
+  --output-dir /scratch/DeepSeek-V3.2-FP8-neuron/
+```
+
+```python
+# Step 2: Compile with FP8 compiler flag
+import os
+os.environ["NEURON_CC_FLAGS"] = "--experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+
+# ... same config as above, using preprocessed model_path ...
+```
+
+FP8 expert weights are dequantized to BF16 using per-tensor scales during weight conversion. The resulting model is numerically equivalent to BF16 (26/27 logit match).
+
 ## Caveats
 
 1. **`logical_nc_config=2` required on trn2** — lnc=1 causes HBM OOM.
@@ -211,7 +245,7 @@ model.load(compiled_path)     # Subsequent: ~53s from NVMe
 4. **MLA incompatible with NeuronAttentionBase** — Custom attention class required.
 5. **`save_sharded_checkpoint=True` strongly recommended** — Avoids re-sharding 1.3TB on every load.
 6. **DSA Indexer increases KV cache** — head_dim grows from 576 (V3.0) to 704 (V3.2) due to indexer key storage. Combined with replicated indexer `wk` weights (~110 MB/NC across 61 layers), this reduces HBM headroom and limits maximum sequence length compared to V3.0.
-7. **FP8 inference blocked** — Fused TKG MoE kernel cannot handle shared expert dim mismatch (2048 vs 18432). Preprocessed FP8 weights ready in S3 for future use.
+7. **FP8 dequantizes to BF16** — True FP8 compute is blocked by NKI kernel limitations (top_k=1 only, shared expert dim mismatch). FP8 source checkpoints are dequantized to BF16 using per-tensor scales during weight conversion. Runtime performance is identical to BF16.
 8. **Thinking/reasoning mode not validated** — DeepSeek V3.2 supports chain-of-thought reasoning via `<think>...</think>` tags, but this requires much larger sequence lengths (4096+) than currently supported. seq_len=512 may work for short reasoning chains but has not been tested with V3.2 due to HBM constraints.
 
 ## Compatibility Matrix
