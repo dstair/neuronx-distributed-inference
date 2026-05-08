@@ -65,17 +65,17 @@ from transformers.activations import ACT2FN
 # through, enabling FP8 expert weights for DeepSeek's MoE layers.
 
 def _patch_moe_expert_mlp_for_fp8(moe_module):
-    """Monkey-patch MoEFusedTKG._expert_mlp to pass FP8 scale tensors.
+    """Register FP8 scale buffers on expert MLP so state dict loading populates them.
 
-    Also registers scale buffers on the expert modules so that state dict
-    loading will populate them from the preprocessed FP8 checkpoint keys
-    (e.g. mlp_op.gate_up_proj.scale, mlp_op.down_proj.scale).
+    The framework's ExpertMLPsV2 already passes scales to the NKI kernel when
+    they exist as attributes on mlp_op.gate_up_proj and mlp_op.down_proj.
+    We just need to register placeholder buffers so the weight loader can
+    populate them from the preprocessed FP8 checkpoint.
     """
     tkg = getattr(moe_module, "moe_fused_tkg", None)
     if tkg is None:
         return
 
-    # Register scale buffers so state dict loading picks up .scale keys
     mlp_op = tkg.expert_mlps.mlp_op
     E = mlp_op.gate_up_proj.weight.shape[0]  # num_experts
     I2 = mlp_op.gate_up_proj.weight.shape[-1]  # 2 * intermediate_size
@@ -83,88 +83,7 @@ def _patch_moe_expert_mlp_for_fp8(moe_module):
     mlp_op.gate_up_proj.register_buffer("scale", torch.ones(E, I2, dtype=torch.float32))
     mlp_op.down_proj.register_buffer("scale", torch.ones(E, H, dtype=torch.float32))
 
-    from neuronx_distributed.modules.moe.moe_fused_tkg import (
-        nki_components, ExpertAffinityScaleMode, nc,
-    )
-    import neuronxcc.nki as nki
 
-    original_expert_mlp = tkg._expert_mlp.__func__  # unbound method
-
-    def _expert_mlp_fp8(self, hidden_states, expert_affinities, expert_index):
-        """Expert MLP with FP8 scale passthrough.
-
-        Bypasses the framework's _can_use_nki_kernel gate (which disables
-        individual kernels due to a compiler regression) and calls the
-        underlying NKI expert_mlps kernel directly with FP8 scale tensors.
-        """
-        hidden_states_shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_states_shape[-1])
-
-        on_device = hidden_states.device.type != "cpu"
-
-        if on_device:
-            grid = (nc(self.logical_nc_config),)
-            if self.expert_mlps.routed_experts_mlp_config.early_expert_affinity_modulation:
-                scaling_mode = ExpertAffinityScaleMode.PRE_SCALE
-            else:
-                scaling_mode = ExpertAffinityScaleMode.POST_SCALE
-
-            gate_up_weights = self.expert_mlps.mlp_op.gate_up_proj.weight
-            gate_up_weights = gate_up_weights.view(
-                self.num_local_experts, self.hidden_size, 2, -1
-            )
-            down_weights = self.expert_mlps.mlp_op.down_proj.weight
-
-            # FP8 scales (populated by state dict loading from preprocessed checkpoint)
-            gate_up_scale = getattr(self.expert_mlps.mlp_op.gate_up_proj, "scale", None)
-            down_scale = getattr(self.expert_mlps.mlp_op.down_proj, "scale", None)
-            if gate_up_scale is not None:
-                gate_up_scale = gate_up_scale.view(self.num_local_experts, 2, -1)
-            if down_scale is not None:
-                down_scale = down_scale.view(self.num_local_experts, -1)
-
-            def _expert_kernel_with_scales(
-                inp, gate_up_weights, down_weights,
-                expert_affinities, expert_index,
-                gate_up_weights_scale, down_weights_scale,
-                expert_affinities_scaling_mode,
-            ):
-                import neuronxcc.nki.language as nl
-                T, K = expert_index.shape
-                _, _, H = down_weights.shape
-                out = nl.ndarray((T, H), dtype=inp.dtype, buffer=nl.shared_hbm)
-                nki_components["expert_mlps"](
-                    inp, gate_up_weights, down_weights,
-                    expert_affinities, expert_index,
-                    gate_up_weights_scale, down_weights_scale,
-                    out, expert_affinities_scaling_mode,
-                )
-                return out
-
-            _call = nki.jit(platform_target="trn2")(_expert_kernel_with_scales)
-            output = _call[grid](
-                inp=hidden_states,
-                gate_up_weights=gate_up_weights,
-                down_weights=down_weights,
-                expert_affinities=expert_affinities,
-                expert_index=expert_index,
-                gate_up_weights_scale=gate_up_scale,
-                down_weights_scale=down_scale,
-                expert_affinities_scaling_mode=scaling_mode,
-            )
-        else:
-            seq_len = hidden_states_shape[1]
-            output = self.expert_mlps(
-                hidden_states=hidden_states,
-                expert_affinities=expert_affinities,
-                expert_index=expert_index,
-                seq_len=seq_len,
-            )
-
-        return output.view(hidden_states_shape)
-
-    import types
-    tkg._expert_mlp = types.MethodType(_expert_mlp_fp8, tkg)
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 logger = logging.getLogger(__name__)
@@ -296,26 +215,18 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
             )
 
         if fp8_preprocessed:
-            # Path B: preprocessed — rename keys and dequantize FP8→BF16 using
-            # per-tensor scales (the sharding pipeline doesn't preserve FP8 dtype).
+            # Path B: preprocessed — keep FP8 expert weights with separate scales.
             for proj in ("gate_up_proj", "down_proj"):
                 w_src = f"layers.{layer_idx}.mlp.experts.{proj}.weight"
                 s_src = f"layers.{layer_idx}.mlp.experts.{proj}.scale"
                 w_dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.{proj}.weight"
+                s_dst = f"layers.{layer_idx}.mlp.expert_mlps.mlp_op.{proj}.scale"
                 if w_src in state_dict:
                     w = state_dict.pop(w_src)
-                    if s_src in state_dict:
-                        s = state_dict.pop(s_src)
-                        # Per-tensor scale: multiply FP8 values by scale to get BF16
-                        # w: (E, ...), s: (E, last_dim) — broadcast over middle dims
-                        w_bf16 = w.to(torch.float32)
-                        if w_bf16.ndim == 3 and s.ndim == 2:
-                            # gate_up: w(E,H,2I) s(E,2I) → s(E,1,2I)
-                            # down:    w(E,I,H)  s(E,H)  → s(E,1,H)
-                            w_bf16 = w_bf16 * s.unsqueeze(1)
-                        else:
-                            w_bf16 = w_bf16 * s
-                        state_dict[w_dst] = w_bf16.to(torch.bfloat16)
+                    s = state_dict.pop(s_src) if s_src in state_dict else None
+                    if s is not None:
+                        state_dict[w_dst] = w
+                        state_dict[s_dst] = s
                     else:
                         state_dict[w_dst] = w.to(torch.bfloat16)
         else:
@@ -356,21 +267,17 @@ def convert_deepseek_v3_hf_to_neuron_state_dict(state_dict: dict, config: "Deeps
         gc.collect()
 
     # When using the TKG module (expert_mlp_nki_kernel_enabled), MoE sub-modules
-    # live under mlp.moe_fused_tkg.* instead of mlp.*.  Remap the keys so the
-    # framework's weight loader can find them.
+    # live under mlp.moe_fused_tkg.* instead of mlp.*.  However, when the decoder
+    # layer sets self.mlp.router = tkg.router (aliasing), PyTorch's state_dict()
+    # lists parameters under the FIRST path (mlp.router.*, mlp.expert_mlps.*).
+    # So we should NOT remap these keys to the TKG path.
+    # Only remap if the modules are NOT aliased (i.e., non-DeepSeek models).
     use_tkg = getattr(config.neuron_config, "expert_mlp_nki_kernel_enabled", False) or \
               getattr(config.neuron_config, "moe_fused_nki_kernel_enabled", False)
     if use_tkg:
-        _TKG_PREFIXES = ("router.", "expert_mlps.", "shared_experts.")
-        remapped = {}
-        for key in list(state_dict.keys()):
-            for pfx in _TKG_PREFIXES:
-                tag = f".mlp.{pfx}"
-                if tag in key:
-                    new_key = key.replace(tag, f".mlp.moe_fused_tkg.{pfx}")
-                    remapped[new_key] = state_dict.pop(key)
-                    break
-        state_dict.update(remapped)
+        # For DeepSeek V3, router and expert_mlps are aliased between
+        # mlp.* and mlp.moe_fused_tkg.* — keep keys under mlp.* (first path)
+        pass
 
     return state_dict
 
@@ -393,11 +300,20 @@ class DeepseekV3Router(GroupLimitedRouter):
     def __init__(self, routed_scaling_factor: float = 2.5, **kwargs):
         super().__init__(**kwargs)
         self.routed_scaling_factor = routed_scaling_factor
-        # e_score_correction_bias is a trained parameter loaded from checkpoint.
-        # GroupLimitedRouter references it in noaux_tc_top_k but doesn't register it.
         self.e_score_correction_bias = nn.Parameter(
             torch.zeros(self.num_experts, dtype=torch.float32)
         )
+        # Transposed weight for the fused TKG mega-kernel
+        self.weight_T = nn.Parameter(
+            torch.empty(self.hidden_size, self.num_experts, dtype=self.dtype)
+        )
+
+    def preshard_hook(self, model_state_dict, prefix):
+        """Create weight_T from linear_router.weight for the fused TKG kernel."""
+        lr_key = prefix.removesuffix("router.weight") + "router.linear_router.weight"
+        wt_key = prefix.removesuffix("router.weight") + "router.weight_T"
+        if lr_key in model_state_dict:
+            model_state_dict[wt_key] = model_state_dict[lr_key].detach().T.clone()
 
     def forward(self, hidden_states):
         router_logits = self.get_router_logits(hidden_states)
@@ -488,10 +404,28 @@ class DeepseekV3InferenceConfig(InferenceConfig):
         # Disable numeric CC token (workaround for all-gather/reduce-scatter)
         self.neuron_config.disable_numeric_cc_token = True
 
+        # Transpose shared expert weights for the fused TKG mega-kernel
+        # (kernel expects [H, I] layout, ColumnParallelLinear stores [I/tp, H])
+        if getattr(self.neuron_config, "moe_fused_nki_kernel_enabled", False):
+            self.neuron_config.transpose_shared_experts_weights = True
+
         # FP8 inference: when quantized_mlp_kernel_enabled is set, ensure
         # the quantized flag is also set so the MoE TKG module picks it up.
         if getattr(self.neuron_config, "quantized_mlp_kernel_enabled", False):
             self.neuron_config.quantized = True
+
+        # Auto-detect FP8 from HF quantization_config
+        quant_cfg = getattr(self, "quantization_config", None)
+        self._is_fp8 = isinstance(quant_cfg, dict) and quant_cfg.get("quant_method") == "fp8"
+
+        # EP=64/TP_MoE=1: each rank gets 4 full experts with intermediate=2048
+        # (satisfies NKI kernel's 128-multiple constraint without padding)
+        tp = getattr(self.neuron_config, "tp_degree", 1)
+        if getattr(self.neuron_config, "moe_ep_degree", 1) == 1 and tp > 1:
+            per_rank_i = self.intermediate_size // tp
+            if per_rank_i < 128 and self.intermediate_size >= 128:
+                self.neuron_config.moe_ep_degree = tp
+                self.neuron_config.moe_tp_degree = 1
 
         # DSA (DeepSeek Sparse Attention) parameters — present in V3.2, absent in V3.0
         self.has_indexer = hasattr(self, "index_n_heads") and getattr(self, "index_n_heads", 0) > 0
@@ -547,7 +481,7 @@ def custom_compiler_args(quantized=False):
     compiler_args += " --tensorizer-options='--vectorize-strided-dma'"
     compiler_args += " --auto-cast=none --internal-hlo2tensorizer-options='--verify-hlo=true'"
     if quantized:
-        compiler_args += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+        pass  # FP8 flag set via NEURON_CC_FLAGS env var
     return compiler_args
 
 
@@ -1151,12 +1085,32 @@ class NeuronDeepseekV3DecoderLayer(nn.Module):
             tkg = getattr(self.mlp, "moe_fused_tkg", None)
             if tkg is not None:
                 tkg.router = custom_router
-            self.mlp.router = custom_router
+                # Also set on base MoE module (needed for its forward path)
+                self.mlp.router = custom_router
+                # Set quantized on TKG config only (not global) for FP8 expert scales
+                if getattr(config, "_is_fp8", False):
+                    tkg.config.quantized = True
+            else:
+                self.mlp.router = custom_router
 
-        # Patch MoE expert MLP to pass FP8 scales
-        if not self.is_dense_layer and (self.moe_fused_nki_kernel_enabled or self.use_expert_nki_kernel):
+        # Patch MoE expert MLP to pass FP8 scales (only when using FP8 weights)
+        if not self.is_dense_layer and getattr(config, "_is_fp8", False) and (self.moe_fused_nki_kernel_enabled or self.use_expert_nki_kernel):
             _patch_moe_expert_mlp_for_fp8(self.mlp)
 
+        # Patch forward_all_experts to use EP version when EP is enabled
+        # (framework bug: CTE/TKG paths don't handle EP correctly)
+        if not self.is_dense_layer:
+            tkg = getattr(self.mlp, "moe_fused_tkg", None)
+            expert_mlps = tkg.expert_mlps if tkg else getattr(self.mlp, "expert_mlps", None)
+            if expert_mlps and expert_mlps.moe_expert_model_parallel_group.size() > 1:
+                expert_mlps.forward_all_experts = expert_mlps.forward_all_experts_EP
+                # Override forward to always use forward_all_experts_EP for EP
+                # (framework uses global num_experts for perc calc, should use local)
+                import types
+                _ep_mlps = expert_mlps
+                def _ep_forward(self, hidden_states, expert_affinities, expert_index, seq_len, padding_mask=None, expert_affinities_masked_full=None):
+                    return _ep_mlps.forward_all_experts_EP(hidden_states, expert_affinities, expert_index)
+                expert_mlps.forward = types.MethodType(_ep_forward, expert_mlps)
 
         self.qkv_kernel_enabled = config.neuron_config.qkv_kernel_enabled
         self.sequence_parallel_enabled = config.neuron_config.sequence_parallel_enabled
@@ -1296,6 +1250,6 @@ class NeuronDeepseekV3ForCausalLM(NeuronBaseForCausalLM):
     def get_compiler_args(self):
         """Return compiler args with --enable-mixed-precision-accumulation for FP32 matmul
         accumulation, matching Mixtral/DBRX/Qwen3 MoE/Qwen2 patterns."""
-        args = custom_compiler_args()
+        args = custom_compiler_args(quantized=getattr(self.config.neuron_config, "quantized", False))
         args += f" --lnc={self.config.neuron_config.logical_nc_config}"
         return args
